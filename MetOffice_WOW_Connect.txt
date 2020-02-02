@@ -1,0 +1,415 @@
+function MetOffice_WOW_Connect()
+{
+/* PREAMBLE:
+   This script collects weather data from TechnoLine Mobile Alerts and TFA Dostmann Weatherhub
+   sensors, recorded in the WeatherHub/Mobile Alerts cloud system. For more info, see
+   http://www.mobile-alerts.eu/index.php/en/
+   https://www.tfa-dostmann.de/en/world-of-tfa/smarthome/
+   
+   The data is then forwarded to the UK MetOffice WOW (Weather Observations Website).
+   For info about WOW, see
+   https://wow.metoffice.gov.uk
+   
+   The code is adapted for the following TechnoLine Mobile Alerts/TFA Dostmann WeatherHub weather
+   sensors: (TechnoLine article number, TFA Dostmann article number)
+   - Thermohygrometer sensor MA10320, 30.3302.02 (ID 09..)
+   - Thermohygrometer sensor MA10241, 30.3312.02  (ID 0E..)
+   - Wind sensor/anemometer MA10660, 30.3307.02 (ID 0B..)
+   - Rain gauge MA10650, 30.3306.02, (ID 08..)
+
+   Similar LaCrosse sensors, made for the European market, should also work.
+   
+   As per 2019-10-01:
+   Special code has also been included in order to obtain readings from the new TFA Dostmann
+   barometer sensor 35.1154.01 "Cosy Baro", similar to the Technoline MA10238
+   although this device is not yet supported by the Mobile Alerts REST API.
+
+***************************************************************************************************
+*/
+/* INITIALIZE SITE PARAMETERS
+   All values below are observation site parameters, and must be set according to the conditions at
+   your site.
+*/
+//  
+/* In order to calculate the rain rate (mm rainfall per hour) the interval between observations given
+   to WOW (= execution frequency for this script) must be defined. The frequency parameter is 
+   (time interval between observation, in minutes / 60),    i.e. 5 min interval -> 12, 10 min
+   interval -> 6, 15 min interval -> 4, 30 min interval -> 2 etc.
+*/
+var observ_exec_freq = 4;
+//
+/*
+   According to WMO standards the wind sensor should be placed 10 m above ground level. If that is not
+   possible (sensor mast height < 10 m) a correction factor will be calculated
+*/     
+var wind_mast_height_m = 5;
+var wind_mast_corr = 1;
+//
+/* Barometric correction factor for the observation site's altitude above mean sea level. Should be
+   calculated according to the standards of your national weather service. 
+*/
+var baro_alt_corr = 1;
+/*  
+    A correction formula, used by the Swedish Meteorological and Hydrological Institute (SMHI) is
+    included in the code, but can be replaced with some other method or omitted.
+    The following observer site parameters are used in the SMHI method to calculate the necessary 
+    air pressure correction factor (if barometer not located directly above mean sea level):
+    
+    - The site's altitude above main sea level, expressed in meters
+    - The site's latitude (gravitational force correction), expressed in degrees
+    
+    As a rule of thumb the air pressure decreases with 1 hPa per 8 m. An approx.
+    correction/calibration can also be made directly in the barometer device 
+    hardware settings
+*/
+var altitude_site_m = 5;
+var latitude_site_deg = 61.8989;
+//
+/* Set up WOW identification for your observation site (the site must be registered
+   in WOW). The site id is supplied by WOW during the registration process. The site
+   authentication key, has to be decided and registered by the observation site
+   owner. For information see
+   https://wow.metoffice.gov.uk/support/dataformats
+*/
+var siteid = '758939f5-0000-0000-b083-0003ff59a71f';
+var siteAuthenticationKey = '9999999';
+//  
+/*  The following parameters are Google Spreadsheet identifiers, used for the rain
+    logic
+*/
+var rainhistory_sheet = '1Gd1XXXXXX0Bssoq20a-Z-gDDLJ9X1qohQet2Ti76TPg';
+//
+/* Actual sensor id:s. These can be found on labels attached to the 
+   the sensors. 
+*/
+var temphumsensor = '0EXXXXCA2B22';
+var windsensor = '0B16XXXXDE4B';
+var rainsensor = '082DBXXXXD3E';
+//  
+/* Phone id for the weather station setup in Weatherhub/MobileAlerts smartphone app
+   used only for the barometric sensor
+*/  
+var phoneid_baro = '550000067390';
+/*
+**************************************************************************************
+*/
+// URL addresses for the different API:s used. These are not to changed.
+// MetOffice WOW API for automatic weather station data uploading
+var wow_api_url = 'http://wow.metoffice.gov.uk/automaticreading?';
+//
+// MobileAlerts/Weatherhub weather data REST API for access to the most recent received measurement
+var ma_api_rest_url = 'https://www.data199.com/api/pv1/device/lastmeasurement';
+//
+// MobileAlerts/Weatherhub weather data HTLM API for web site presentation
+var ma_api_measure_url = 'https://measurements.mobile-alerts.eu/';
+/*
+***************************************************************************************
+*/
+/* OBTAIN WEATHER SENSOR READINGS
+Set up parameter list (= sensor id:s) for the Mobile Alerts REST API.
+   The sensors id:s  m u s t  be entered in the order
+   temp/humidity sensor, wind sensor,rain sensor
+   For info. about the API, see
+   http://www.mobile-alerts.eu/images/public_server_api_documentation.pdf
+*/
+var devices = 'deviceids=' + temphumsensor + ',' + windsensor + ',' + rainsensor;  
+var options = {
+    'method' : 'post',
+    'payload' : devices,
+    'muteHttpExceptions' : true
+};
+// Call Mobile Alerts REST API in order to obtain weather data
+var response = UrlFetchApp.fetch(ma_api_rest_url, options);
+var httpcodema =  response.getResponseCode();
+      // Error handling for http reqest  
+  if (httpcodema != 200)
+      {
+     var maerr = response.getContentText();
+     Logger.log(maerr);
+     Logger.log('Mobile Alerts httpcode: ' + (httpcodema).toFixed(0));
+     var subject = 'Error in function MetOffice_WOW_Connect';
+     var recipient = Session.getActiveUser().getEmail();
+     var body = Logger.getLog();
+     MailApp.sendEmail(recipient, subject, body);
+     return;
+      }; 
+// Decode JSON data into a java script object
+var json = response.getContentText();
+var data = JSON.parse(json);
+/*
+    Obtain weather data from the java script object
+*/
+// Pick up relative humidity (%)  
+var hum = data.devices[0].measurement.h;
+//
+// Pick up outdoor temperature (degrees Celsius)
+var tempc = data.devices[0].measurement.t1;
+//
+// Pick upp wind data readings
+var windspeed = data.devices[1].measurement.ws;
+var windgust = data.devices[1].measurement.wg;
+var winddir = data.devices[1].measurement.wd;
+//
+// Pick up total rainfall (mm) and timestamp (UNIX format) of the measurement from rain gauge.
+// The total rainfall is an ever increasing value, a counter/ackumulator of the total rainfall
+//  measured since the gauge was activated for the first time
+var totalrainmm = data.devices[2].measurement.r;
+var rain_measurement_timestamp_epoch = data.devices[2].measurement.ts;
+//
+//------------------------------------------------------------------------------------------
+// Pick up air pressure readings
+/*  
+    For the time beeing the Mobile Alerts REST API does not support the barometric sensor
+    TFA Dostmann 35.1154.01 "Cosy Baro"/TechnoLine MA10238. The air pressure readings must be
+    picked up via a HTML presentation API request. This is provisional code. A special
+    WeatherHub/Mobile Alerts smartphone app setup (identified via the "phone id") is needed
+    for this workaround.
+*/
+//
+var formData_baro = {
+  'phoneid' : phoneid_baro
+     }
+  var options_baro = {
+  'method' : 'post',
+  'payload' :formData_baro,
+  'muteHttpExceptions' : true
+};
+var response = UrlFetchApp.fetch(ma_api_measure_url, options_baro);
+  var barostring = response.getContentText();
+var n = barostring.search('hPa'); 
+var pressure = barostring.slice(n - 7,n - 1);
+if (isNaN(parseFloat(pressure)))
+   { pressure = barostring.slice(n - 6,n - 1); } ;
+var barom_site = parseFloat(pressure);
+/*
+**************************************************************************************************
+*/
+/* PREPARE AND PROCESS WEATHER DATA
+*/
+// Calculate dew point from actual temp and humidity
+var dewptc = (237.7 * ((17.27 * tempc) / (237.7 + tempc) + Math.log(hum / 100))) 
+    / (17.7 - ((17.27 * tempc)  / (237.7 + tempc) + Math.log(hum / 100)));
+//-----------------------------------------------------------------------------------
+// Obtain actual UTC timestamp (formatted as a string in ISO format)
+var formattedDateUTC = Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd HH:mm:ss");
+//-----------------------------------------------------------------------------------
+/*  Logic for the accumulated rainfall during the actual day and since the latest (previous)
+    observation during the same day. This logic is due to the fact that the Mobile Alerts
+    REST API can only deliver the most recently received readings from the sensors. The 
+    rain gauge can deliver only one reading, accumulated rainfall since the gauge was 
+    activated for the first time (an ever increasing value). Due to that some logic herein
+    must calculate the rainfall values during the actual day (i,e. 24 hour period from
+    midnight to midnight in the observer site's time zone).The actual day's first
+    observation (after midnight) and latest (previous) observation
+    are stored in the spreadsheet rainhistory.  
+*/
+// Convert rain measurement timestamp from sensor to date formate and extract the date  
+var rain_measurement_timestamp = new Date(rain_measurement_timestamp_epoch * 1000);
+var rain_measurement_date = rain_measurement_timestamp.getDate(); 
+//
+//  Obtain data from rainhistory  
+var rainhistory = SpreadsheetApp.openById(rainhistory_sheet);
+var data = rainhistory.getDataRange().getValues();
+var history_timestamp = new Date(data[1][0]);
+var historydate = history_timestamp.getDate();
+var Totalrainstart = data[1][1];
+var Totalrainlatest = data[1][2];
+//  
+// Obtain actual date (= day number)
+var todaysdate =  new Date();
+var actualdate = todaysdate.getDate();
+var formattedDate 
+    = Utilities.formatDate(todaysdate, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
+//  
+/* If the date has shifted (new day), set starting values for the rain history
+   If the same date, calculate the accumulated precipitation. Set value for accumulated
+   rainfall.
+   If no precipitation since date shift, set rain value to zero
+*/
+var dailyrainmm = 0;
+var rainmm = 0;
+if (actualdate != historydate)
+   // Date shift (new date), reset all values
+   {
+    dailyrainmm = 0;
+    rainmm = 0;
+    rainhistory.getRange('A2').setValue(formattedDate);
+    rainhistory.getRange('B2').setValue(totalrainmm);
+    rainhistory.getRange('C2').setValue(0);
+    rainhistory.getRange('D2').setValue(formattedDate);
+   }  
+else
+    // Same date (no date shift)
+   {
+    if  ( (totalrainmm != Totalrainstart) && (actualdate == rain_measurement_date) )
+       {
+        /* if precipitation since beginning of the day, calculate
+           accumulated rainfall so far
+        */ 
+        dailyrainmm = totalrainmm - Totalrainstart;
+        if (Totalrainlatest != 0)
+           /* if not first occurance of precipitation during the
+              day, calculate the rainfall since last observation
+              and multiply with observation frequency in order to
+              get the rain rate (mm rainfall per hour)
+           */
+           {rainmm = observ_exec_freq * (totalrainmm - Totalrainlatest); }
+        else
+            /* if first occurance of precipitation during the day, the
+               rainfall since last observation is the same as the
+               accumulated rainfall for the actual day. Calculate rain
+               rate in the same manner as above
+            */
+           {rainmm = observ_exec_freq * dailyrainmm; };
+        /* 
+           save accumulated rainfall for this observation in the
+           rainhistory spreadsheet. Used in the next upcoming observation
+           in order to calculate rainfall since last observation. This is done only
+           if precipitation has been measured since the last observation.
+        */
+           if (totalrainmm != Totalrainlatest )
+               { rainhistory.getRange('C2').setValue(totalrainmm);
+                 rainhistory.getRange('D2').setValue(formattedDate);};
+         }
+    else
+       {
+        // no precipitation since beginning of the actual day 
+        dailyrainmm = 0;
+        rainmm = 0;
+        }
+   };
+//-----------------------------------------------------------------------------------
+/* The wind sensor reports wind directions with a resolution of 22.5 degrees, i.e.
+   0=N, 1=NNE, 2=NE, 3=ENE etc. Calculate the wind direction in degrees. North/N
+   (value 0 from sensor) is expressed as 360 in WOW. The direction 0 degrees is
+   interpreted as "shifting winds" (no certain wind direction can be determined) 
+   in WOW, and is used only when windspeed is 0.
+*/
+var winddirdeg = '360';
+if ( winddir != 0 )  
+   { winddirdeg = (winddir * 22.5).toFixed(0); };
+//    
+/* The wind sensor is to be placed 10 meters above ground level. Lower heights must be
+   compensated with a corretion factor, calculated with the formula
+   = 1/(0.233 + 0.656 * log10(height + 4.75))
+*/
+var windspeedms = windspeed * 1;
+var windgustms = windgust * 1;
+//
+if ((windspeedms != 0) ) 
+   { if (wind_mast_height_m < 10)
+        { wind_mast_corr = (1 / (0.233 + 0.656 * Math.LOG10E * Math.log(wind_mast_height_m + 4.75)));
+          windspeedms = windspeed * wind_mast_corr;
+          windgustms = windgust * wind_mast_corr; 
+        }
+   }
+else
+    { winddirdeg = '000'; };  
+//-----------------------------------------------------------------------------------
+/*
+    Calculate air pressure at mean sea level. There is no WMO concensus on how to
+    make this so called barometer reduction. See WMO Technical note no. 91
+    "Methods in use for the reduction of atmospheric pressue".
+    https://library.wmo.int/doc_num.php?explnum_id=3445
+    
+    The following code is based on a method used by the Swedish Meteorological and
+    Hydrological Institute (SMHI). It includes compensation for altitude, temperature
+    and gravitational force (depending on latitude).
+*/
+var lat_corr = 0.034163 * (1 - 0.0026373 * Math.cos(2 * latitude_site_deg * Math.PI / 180));
+var tempcorr = tempc;
+if  ((tempc >= -7.0) && (tempc < 2.0))
+    { tempcorr = 0.535 * tempc + 275.6; }
+else
+    if (tempc < -7.0)
+        { tempcorr = 0.500 * tempc + 275.0; }
+    else
+        { tempcorr = 1.07 * tempc + 274.5; } ;
+baro_alt_corr = Math.exp(altitude_site_m * lat_corr / tempcorr);
+//----------------------------------------------------------------------------------------  
+//
+var baromhPa = barom_site * baro_alt_corr;
+/*
+****************************************************************************************
+    The following code is for UK Metoffice WOW reporting only, and can be replaced
+    with similar code for another weather network 
+**************************************************************************************** 
+*/
+/* CONVERT SENSOR READINGS TO IMPERIAL UNITS
+   The weather data is forwarded to the UK MetOffice WOW service via 
+   the WOW REST API. For info about the API see
+   https://wow.metoffice.gov.uk/support/dataformats  
+   This service does not accept input in metric units. Convert
+   all relevant data to imperial units (temp F, mph, inch (Hg))
+
+   The relative humidity is already in % and the wind direction
+   has been calculated as azimuth degrees (clockwise angle from true north = 0).
+   These latter values are not to be converted.
+*/
+var tempf = ((tempc * 1.8) + 32).toFixed(1);
+var dewptf = ((dewptc * 1.8) + 32).toFixed(1);
+//
+/* 
+   The wind speed conversion factor m/s -> mph  =  2.236936
+*/
+var windspeedmph = (windspeedms * 2.236936).toFixed(2); 
+var windgustmph = (windgustms * 2.236936).toFixed(2);
+/*  
+    The rain conversion factor mm -> inches  =  0.0393701
+*/
+var dailyrainin = (dailyrainmm * 0.0393701).toFixed(3);
+var rainin = (rainmm * 0.0393701).toFixed(3);  
+/*
+   The air pressure conversion factor hPa -> inches Hg  =  0.029529983071445
+*/
+var baromin = (baromhPa * 0.029529983071445).toFixed(3);
+/*
+*******************************************************************************************
+*/
+/*  DELIVER WEATHER DATA TO THE UK METOFFICE WOW SERVICE
+    http://www.wow.metoffice.gov.uk/
+*/
+// Set up parameter list for the MetOffice WOW api
+var formData = {
+  'siteid' : siteid,
+  'siteAuthenticationKey' : siteAuthenticationKey,
+  'dateutc' :  formattedDateUTC,
+    'tempf' :  tempf,
+    'humidity' : hum,
+   'windspeedmph' :  windspeedmph,
+   'windgustmph'  :  windgustmph,
+   'winddir': winddirdeg,
+    'dewptf' : dewptf,
+    'dailyrainin' : dailyrainin,
+    'rainin' : rainin,
+    'baromin' : baromin,
+    'softwaretype' : 'GoogleDocs1.0'
+  }
+  var options = {
+    'contentType' : 'application/x-www-form-urlencoded',
+    'method' : 'post',
+    'payload' : formData,
+    'muteHttpExceptions' : true
+};
+// Call the WOW api and obtain response code
+var response = UrlFetchApp.fetch(wow_api_url, options);
+var httpcodewow =  response.getResponseCode();
+/*  
+*/
+  if (httpcodewow != 200)
+   {
+     // Error handling for http reqest
+     var wowerr = response.getContentText();
+     Logger.log(wowerr);
+     Logger.log('MetOffice WOW httpcode: ' + (httpcodewow).toFixed(0));
+     var subject = 'Error in function MetOffice_WOW_Connect';
+     var recipient = Session.getActiveUser().getEmail();
+     var body = Logger.getLog();
+     MailApp.sendEmail(recipient, subject, body);
+   };
+/*
+************************************************************************************************
+   End of code for Metoffice WOW reporting
+************************************************************************************************
+*/
+}  
